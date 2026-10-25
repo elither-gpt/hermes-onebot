@@ -1,0 +1,31 @@
+name: onebot
+label: QQ (OneBot)
+kind: platform
+version: 0.2.0
+description: >
+  QQ via OneBot v11 (NapCat, forward WebSocket). Ported from an OpenClaw
+  "qq" channel plugin: group @-trigger, admin list, Markdown stripping,
+  reply/forward context, inbound images/voice/video/files and outbound
+  images/voice/video/files.
+author: elither-gpt (behaviour ported from constansino/openclaw_qq)
+optional_env:
+  - name: ONEBOT_WS_URL
+    description: "OneBot forward WebSocket URL (e.g. ws://127.0.0.1:3001)"
+    prompt: "OneBot WebSocket URL"
+    password: false
+  - name: ONEBOT_ACCESS_TOKEN
+    description: "OneBot access token (must match NapCat's websocket server token)"
+    prompt: "OneBot access token"
+    password: true
+  - name: ONEBOT_ALLOW_ALL_USERS
+    description: "Let every QQ user talk to the bot (group chats still need an @)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: ONEBOT_ALLOWED_USERS
+    description: "Comma-separated QQ numbers allowed to talk to the bot"
+    prompt: "Allowed QQ numbers"
+    password: false
+  - name: ONEBOT_HOME_CHANNEL
+    description: "Default cron delivery target: a QQ number, or g<group id> for a group"
+    prompt: "Home channel"
+    password: false
