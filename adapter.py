@@ -61,7 +61,7 @@ _MAX_INBOUND_IMAGES = 5
 _IMAGE_MAX_BYTES = 64 * _MIB
 _AUDIO_MAX_BYTES = 64 * _MIB
 _LOOKUP_BUDGET = 30
-_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HermesOneBot/0.2"
+_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HermesOneBot/0.2.1"
 _RESUME_WAIT_S = 20.0  # how long a half-sent reply waits for the reconnect before giving up the rest
 _MAX_BACKGROUND_COMMANDS = 3
 _BARE_CMD_RE = re.compile(r"^/([A-Za-z][A-Za-z0-9_-]*)(?:\s|$)")
@@ -140,6 +140,12 @@ def _local_path_from_ref(ref: str) -> Optional[str]:
     return None
 
 
+def _http_ref(d: dict) -> Optional[str]:
+    """Download URL of a media segment: ``url``, or ``file`` when that is an http(s) URL."""
+    file = str(d.get("file") or "")
+    return d.get("url") or (file if re.match(r"^https?://", file, re.I) else None)
+
+
 def _guess_image_ext(data: bytes, name_hint: str = "") -> str:
     head = data[:16]
     if head.startswith(b"\x89PNG"):
@@ -182,10 +188,10 @@ def _split_text(text: str, limit: int) -> list[str]:
 # --------------------------------------------------------------------------- Markdown filter
 
 _LATEX_OPS = (
-    (re.compile(r"\\geq?\b"), "≥"),
-    (re.compile(r"\\leq?\b"), "≤"),
-    (re.compile(r"\\times\b"), "×"),
-    (re.compile(r"\\div\b"), "÷"),
+    (re.compile(r"\\geq?(?![A-Za-z])"), "≥"),
+    (re.compile(r"\\leq?(?![A-Za-z])"), "≤"),
+    (re.compile(r"\\times(?![A-Za-z])"), "×"),
+    (re.compile(r"\\div(?![A-Za-z])"), "÷"),
 )
 
 
@@ -303,6 +309,21 @@ def _as_segments(message: Any) -> list[dict]:
     if isinstance(message, str):
         return parse_cq_string(message)
     return []
+
+
+def _msg_segments(msg: dict) -> list[dict]:
+    """Segments of a OneBot message object (``message``, falling back to ``raw_message``)."""
+    return _as_segments(msg.get("message")) or _as_segments(msg.get("raw_message") or "")
+
+
+def _node_segments(node: dict) -> list[dict]:
+    """Segments of a merged-forward node (``message`` or ``content``, then ``raw_message``)."""
+    content = node.get("message") if node.get("message") is not None else node.get("content")
+    return _as_segments(content if content is not None else node.get("raw_message") or "")
+
+
+def _message_id(data: Any) -> Optional[str]:
+    return str(data["message_id"]) if isinstance(data, dict) and data.get("message_id") is not None else None
 
 
 # --------------------------------------------------------------------------- OneBot connection
@@ -435,6 +456,30 @@ class OneBotConnection:
 
 
 # --------------------------------------------------------------------------- adapter
+
+class _Media:
+    """Inbound attachments collected for one MessageEvent."""
+
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+        self.types: list[str] = []
+        self.inlined: list[Optional[bool]] = []
+        self.notes: list[str] = []
+        self.voice = False
+
+    @property
+    def image_count(self) -> int:
+        return sum(t.startswith("image/") for t in self.types)
+
+    def add(self, got: Optional[tuple[str, str]], note: Optional[str] = None, *,
+            inlined: Optional[bool] = None) -> None:
+        if got:
+            self.urls.append(got[0])
+            self.types.append(got[1])
+            self.inlined.append(inlined)
+        if note:
+            self.notes.append(note)
+
 
 class OneBotAdapter(BasePlatformAdapter):
     """QQ through NapCat's OneBot v11 forward WebSocket."""
@@ -711,7 +756,7 @@ class OneBotAdapter(BasePlatformAdapter):
             return
         is_admin = self.is_admin(user_id)
 
-        segments = _as_segments(ev.get("message")) or _as_segments(ev.get("raw_message") or "")
+        segments = _msg_segments(ev)
         parsed = self._parse_segments(segments, self_id)
         text = parsed["text"].strip()
         text = re.sub(r"^[／/]", "/", text)
@@ -762,45 +807,18 @@ class OneBotAdapter(BasePlatformAdapter):
         if m and self._start_background_command(m.group(1).lower().replace("_", "-"), m.group(2).strip(), source):
             return
 
-        # ---- media
+        # ---- media: the message's own, then the quoted message's, then images inside forwards
         budget = {"lookup": _LOOKUP_BUDGET}
-        media_urls: list[str] = []
-        media_types: list[str] = []
-        inlined: list[Optional[bool]] = []
-        notes: list[str] = []
+        media = _Media()
         ctx_ids = {"group_id": _maybe_int(group_id) if is_group else None, "user_id": _maybe_int(user_id)}
-
-        for d in parsed["images"][:_MAX_INBOUND_IMAGES]:
-            got = await self._resolve_image(d)
-            if got:
-                media_urls.append(got[0]); media_types.append(got[1]); inlined.append(None)
-        has_voice = False
-        for d in parsed["records"]:
-            got = await self._resolve_record(d)
-            if got:
-                media_urls.append(got[0]); media_types.append(got[1]); inlined.append(None)
-                has_voice = True
-            else:
-                notes.append("[语音：下载失败]")
-        for d in parsed["videos"]:
-            got, note = await self._resolve_video(d)
-            if got:
-                media_urls.append(got[0]); media_types.append(got[1]); inlined.append(None)
-            if note:
-                notes.append(note)
-        for d in parsed["files"]:
-            got, note = await self._resolve_file(d, ctx_ids)
-            if got:
-                media_urls.append(got[0]); media_types.append(got[1]); inlined.append(False)
-            if note:
-                notes.append(note)
+        await self._collect_media(parsed, ctx_ids, media)
 
         # ---- reply + forward context
         reply_kwargs: dict[str, Any] = {}
         if isinstance(replied, dict):
             r_sender = replied.get("sender") or {}
             r_uid = str(r_sender.get("user_id") or replied.get("user_id") or "")
-            r_segments = _as_segments(replied.get("message")) or _as_segments(replied.get("raw_message") or "")
+            r_segments = _msg_segments(replied)
             r_sum = self._summarize(r_segments, 4000)
             r_own = bool(self_id) and r_uid == self_id
             r_name = _labelled_sender(r_uid, r_sender.get("card") or r_sender.get("nickname")) if r_uid else None
@@ -813,49 +831,20 @@ class OneBotAdapter(BasePlatformAdapter):
                 "reply_to_author_name": r_name,
                 "reply_to_is_own_message": r_own,
             }
-            for d in r_sum["images"]:
-                if len([t for t in media_types if t.startswith("image/")]) >= _MAX_INBOUND_IMAGES:
-                    break
-                got = await self._resolve_image(d)
-                if got:
-                    media_urls.append(got[0]); media_types.append(got[1]); inlined.append(None)
             # A QQ file message cannot carry an @, so "reply to the file + @bot" is how a group hands
             # the bot a file (or a video / voice message): fetch those like the message's own.
             r_ctx = {"group_id": ctx_ids["group_id"], "user_id": _maybe_int(r_uid) if r_uid else ctx_ids["user_id"]}
-            for d in r_sum["records"]:
-                got = await self._resolve_record(d)
-                if got:
-                    media_urls.append(got[0]); media_types.append(got[1]); inlined.append(None)
-                    has_voice = True
-                else:
-                    notes.append("[引用的语音：下载失败]")
-            for d in r_sum["videos"]:
-                got, note = await self._resolve_video(d)
-                if got:
-                    media_urls.append(got[0]); media_types.append(got[1]); inlined.append(None)
-                if note:
-                    notes.append(note)
-            for d in r_sum["files"]:
-                got, note = await self._resolve_file(d, r_ctx)
-                if got:
-                    media_urls.append(got[0]); media_types.append(got[1]); inlined.append(False)
-                if note:
-                    notes.append(note)
+            await self._collect_media(r_sum, r_ctx, media, quoted=True)
         history_block = await self._group_history(group_id, msg_id, ev.get("time")) if is_group else ""
         layers_block = ""
         if self.enrich_context and (parsed["forwards"] or replied):
             layers_block, layer_images = await self._build_layers(parsed["forwards"], replied, budget)
-            for d in layer_images:
-                if len([t for t in media_types if t.startswith("image/")]) >= _MAX_INBOUND_IMAGES:
-                    break
-                got = await self._resolve_image(d)
-                if got:
-                    media_urls.append(got[0]); media_types.append(got[1]); inlined.append(None)
+            await self._collect_media({"images": layer_images}, ctx_ids, media)
         channel_context = "\n\n".join(b for b in (history_block, layers_block) if b) or None
 
-        if notes:
-            text = (text + "\n" + "\n".join(notes)).strip()
-        if not text and not media_urls:
+        if media.notes:
+            text = (text + "\n" + "\n".join(media.notes)).strip()
+        if not text and not media.urls:
             if parsed["reply_id"]:
                 text = "[回复消息]"
             elif parsed["forwards"]:
@@ -867,13 +856,13 @@ class OneBotAdapter(BasePlatformAdapter):
             else:
                 return
 
-        if has_voice:
+        if media.voice:
             message_type_enum = MessageType.VOICE
-        elif any(t.startswith("image/") for t in media_types):
+        elif media.image_count:
             message_type_enum = MessageType.PHOTO
-        elif any(t.startswith("video/") for t in media_types):
+        elif any(t.startswith("video/") for t in media.types):
             message_type_enum = MessageType.VIDEO
-        elif media_urls:
+        elif media.urls:
             message_type_enum = MessageType.DOCUMENT
         else:
             message_type_enum = MessageType.TEXT
@@ -881,13 +870,30 @@ class OneBotAdapter(BasePlatformAdapter):
         ts = ev.get("time")
         event = MessageEvent(
             text=text, message_type=message_type_enum, source=source, raw_message=ev,
-            message_id=msg_id or None, media_urls=media_urls, media_types=media_types,
-            media_text_inlined=inlined, channel_context=channel_context,
+            message_id=msg_id or None, media_urls=media.urls, media_types=media.types,
+            media_text_inlined=media.inlined, channel_context=channel_context,
             timestamp=datetime.datetime.fromtimestamp(ts) if isinstance(ts, (int, float)) else datetime.datetime.now(),
             **reply_kwargs)
         logger.info("[OneBot] inbound %s user=%s admin=%s media=%d text=%r", chat_id, user_id, is_admin,
-                    len(media_urls), text[:80])
+                    len(media.urls), text[:80])
         await self.handle_message(event)
+
+    async def _collect_media(self, items: dict, ctx: dict, media: _Media, *, quoted: bool = False) -> None:
+        """Download the images / voice / videos / files listed in ``items`` (``_parse_segments`` or
+        ``_summarize`` output) into Hermes' caches and add them to ``media``."""
+        for d in items.get("images") or []:
+            if media.image_count >= _MAX_INBOUND_IMAGES:
+                break
+            media.add(await self._resolve_image(d))
+        for d in items.get("records") or []:
+            got = await self._resolve_record(d)
+            media.add(got, None if got else ("[引用的语音：下载失败]" if quoted else "[语音：下载失败]"))
+            media.voice = media.voice or bool(got)
+        for d in items.get("videos") or []:
+            media.add(*await self._resolve_video(d))
+        for d in items.get("files") or []:
+            got, note = await self._resolve_file(d, ctx)
+            media.add(got, note, inlined=False)
 
     def _parse_segments(self, segments: list[dict], self_id: str) -> dict:
         texts: list[str] = []
@@ -1003,10 +1009,7 @@ class OneBotAdapter(BasePlatformAdapter):
             return ""
         sender = node.get("sender") or {}
         name = sender.get("card") or sender.get("nickname") or node.get("user_id") or "unknown"
-        content = node.get("message") if node.get("message") is not None else node.get("content")
-        if content is None:
-            content = node.get("raw_message") or ""
-        return f"{name}: {self._summarize(_as_segments(content), max_chars)['text']}"
+        return f"{name}: {self._summarize(_node_segments(node), max_chars)['text']}"
 
     async def _build_layers(self, root_forwards: list[str], replied: Optional[dict], budget: dict) -> tuple[str, list[dict]]:
         lines: list[str] = []
@@ -1044,7 +1047,7 @@ class OneBotAdapter(BasePlatformAdapter):
         for layer in range(1, self.max_reply_layers + 1):
             if not isinstance(cursor, dict):
                 break
-            segs = _as_segments(cursor.get("message")) or _as_segments(cursor.get("raw_message") or "")
+            segs = _msg_segments(cursor)
             summary = self._summarize(segs, self.max_chars_per_layer)
             enqueue(summary["forwards"], 1, "forward-in-reply")
             if layer > 1:
@@ -1072,10 +1075,7 @@ class OneBotAdapter(BasePlatformAdapter):
                 sender = node.get("sender") or {}
                 name = _labelled_sender(sender.get("user_id") or node.get("user_id"),
                                         sender.get("card") or sender.get("nickname"))
-                content = node.get("message") if node.get("message") is not None else node.get("content")
-                if content is None:
-                    content = node.get("raw_message") or ""
-                summary = self._summarize(_as_segments(content), self.max_chars_per_layer)
+                summary = self._summarize(_node_segments(node), self.max_chars_per_layer)
                 push(f"[Layer F{depth}.{idx}][{tag}][from:{name}] {summary['text'] or '(空文本)'}")
                 images.extend(summary["images"])
                 if depth < self.max_forward_layers:
@@ -1119,7 +1119,7 @@ class OneBotAdapter(BasePlatformAdapter):
             uid = str(sender.get("user_id") or r.get("user_id") or "")
             name = ("（你自己）" if uid and uid == self._self_id
                     else _labelled_sender(uid, sender.get("card") or sender.get("nickname")))
-            segs = _as_segments(r.get("message")) or _as_segments(r.get("raw_message") or "")
+            segs = _msg_segments(r)
             lines.append(f"{name}: {self._summarize(segs, self.max_chars_per_layer)['text'] or '(空文本)'}")
         return "<history>\n" + "\n".join(lines) + "\n</history>" if lines else ""
 
@@ -1242,49 +1242,44 @@ class OneBotAdapter(BasePlatformAdapter):
             return True
         return await asyncio.to_thread(is_safe_url, url)
 
-    async def _fetch_bytes(self, url: str, max_bytes: int) -> Optional[bytes]:
+    async def _http_get(self, url: str, max_bytes: int, write: Callable[[bytes], Any], timeout: float) -> bool:
+        """Stream ``url`` into ``write``; False for non-http / unsafe URLs, raises on errors or > max_bytes."""
         import httpx
         if not re.match(r"^https?://", url or "", re.I) or not await self._url_is_safe(url):
-            return None
+            return False
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=15.0), follow_redirects=True) as client:
+            async with client.stream("GET", url, headers={"User-Agent": _USER_AGENT}) as resp:
+                resp.raise_for_status()
+                total = 0
+                async for chunk in resp.aiter_bytes(256 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f"payload over {max_bytes} bytes")
+                    write(chunk)
+        return True
+
+    async def _fetch_bytes(self, url: str, max_bytes: int) -> Optional[bytes]:
+        buf = bytearray()
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0), follow_redirects=True) as client:
-                async with client.stream("GET", url, headers={"User-Agent": _USER_AGENT}) as resp:
-                    resp.raise_for_status()
-                    chunks, total = [], 0
-                    async for chunk in resp.aiter_bytes():
-                        total += len(chunk)
-                        if total > max_bytes:
-                            raise ValueError(f"payload over {max_bytes} bytes")
-                        chunks.append(chunk)
-            return b"".join(chunks)
+            return bytes(buf) if await self._http_get(url, max_bytes, buf.extend, 60.0) else None
         except Exception as exc:
             logger.debug("[OneBot] download failed %s: %s", url[:80], exc)
             return None
 
     async def _download_to(self, url: str, dest: Path, max_bytes: int) -> bool:
-        """Stream a (possibly huge) attachment straight to disk; no in-memory cap involved."""
-        import httpx
-        if not re.match(r"^https?://", url or "", re.I) or not await self._url_is_safe(url):
-            return False
+        """Stream a (possibly huge) attachment straight to disk."""
         tmp = dest.with_name(dest.name + ".part")
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0), follow_redirects=True) as client:
-                async with client.stream("GET", url, headers={"User-Agent": _USER_AGENT}) as resp:
-                    resp.raise_for_status()
-                    total = 0
-                    with open(tmp, "wb") as fh:
-                        async for chunk in resp.aiter_bytes(1024 * 256):
-                            total += len(chunk)
-                            if total > max_bytes:
-                                raise ValueError(f"payload over {max_bytes} bytes")
-                            fh.write(chunk)
-            os.replace(tmp, dest)
-            return True
+            with open(tmp, "wb") as fh:
+                ok = await self._http_get(url, max_bytes, fh.write, 120.0)
+            if ok:
+                os.replace(tmp, dest)
+                return True
         except Exception as exc:
             logger.warning("[OneBot] attachment download failed: %s", exc)
-            with contextlib.suppress(OSError):
-                tmp.unlink()
-            return False
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return False
 
     def _to_napcat_path(self, local: str) -> str:
         """Host path -> path NapCat can open (WSL: C:\\x -> /mnt/c/x, \\\\wsl.localhost\\D\\x -> /x)."""
@@ -1376,7 +1371,7 @@ class OneBotAdapter(BasePlatformAdapter):
     async def _resolve_image(self, d: dict) -> Optional[tuple[str, str]]:
         data: Optional[bytes] = None
         name = str(d.get("file") or d.get("name") or "")
-        url = d.get("url") or (d.get("file") if re.match(r"^https?://", str(d.get("file") or ""), re.I) else None)
+        url = _http_ref(d)
         if url:
             data = await self._fetch_bytes(str(url), _IMAGE_MAX_BYTES)
         if data is None:
@@ -1386,12 +1381,10 @@ class OneBotAdapter(BasePlatformAdapter):
         if data is None and d.get("file"):
             info = await self._safe_call("get_image", {"file": d.get("file")}, timeout=30) or {}
             data = await self._local_or_wsl_bytes(info.get("file"), _IMAGE_MAX_BYTES)
-            if data is not None:
-                pass
-            elif info.get("base64"):
+            if data is None and info.get("base64"):
                 with contextlib.suppress(Exception):
                     data = base64.b64decode(info["base64"])
-            elif info.get("url"):
+            if data is None and info.get("url"):
                 data = await self._fetch_bytes(str(info["url"]), _IMAGE_MAX_BYTES)
         if not data:
             return None
@@ -1420,7 +1413,7 @@ class OneBotAdapter(BasePlatformAdapter):
                 with contextlib.suppress(Exception):
                     data = base64.b64decode(info["base64"])
         if data is None:
-            url = d.get("url") or (d.get("file") if re.match(r"^https?://", str(d.get("file") or ""), re.I) else None)
+            url = _http_ref(d)
             if url:
                 data = await self._fetch_bytes(str(url), _AUDIO_MAX_BYTES)
                 ext = os.path.splitext(urlparse(str(url)).path)[1].lower() or ".amr"
@@ -1453,7 +1446,7 @@ class OneBotAdapter(BasePlatformAdapter):
         if local:
             await asyncio.to_thread(shutil.copyfile, local, dest)
             ok = True
-        url = d.get("url") or (d.get("file") if re.match(r"^https?://", str(d.get("file") or ""), re.I) else None)
+        url = _http_ref(d)
         if not ok and url:
             ok = await self._download_to(str(url), dest, self.inbound_file_max_bytes)
         if not ok and (d.get("file") or d.get("file_id")):
@@ -1567,8 +1560,8 @@ class OneBotAdapter(BasePlatformAdapter):
             if status == "not_sent" and on_screen and await self._wait_connected(_RESUME_WAIT_S):
                 status, data = await self._send_chunk(kind, target, segs)
             if status == "sent":
-                if isinstance(data, dict) and data.get("message_id") is not None:
-                    ids.append(str(data["message_id"]))
+                if _message_id(data):
+                    ids.append(_message_id(data))
             elif status == "unconfirmed":
                 # may already be on screen: never resent (same rule as media uploads)
                 unconfirmed += 1
@@ -1701,8 +1694,7 @@ class OneBotAdapter(BasePlatformAdapter):
         seg = {"type": kind, "data": {"file": file_ref}}
         try:
             data = await self._send_segments(chat_kind, target, [seg], timeout=send_timeout)
-            mid = str(data.get("message_id")) if isinstance(data, dict) and data.get("message_id") is not None else None
-            return SendResult(success=True, message_id=mid)
+            return SendResult(success=True, message_id=_message_id(data))
         except OneBotTimeout as exc:
             logger.warning("[OneBot] %s send unconfirmed (%s); not resending to avoid duplicates", kind, exc)
             return SendResult(success=True, raw_response={"pending": True, "note": str(exc)})
@@ -1734,8 +1726,7 @@ class OneBotAdapter(BasePlatformAdapter):
             try:
                 data = await self._send_segments(chat_kind, target, [{"type": "file", "data": {"file": file_ref, "name": name}}],
                                                  timeout=timeout)
-                mid = str(data.get("message_id")) if isinstance(data, dict) and data.get("message_id") is not None else None
-                return SendResult(success=True, message_id=mid)
+                return SendResult(success=True, message_id=_message_id(data))
             except OneBotTimeout:
                 return SendResult(success=True, raw_response={"pending": True})
             except Exception as exc2:
